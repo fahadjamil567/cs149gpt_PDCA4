@@ -23,6 +23,7 @@ To calculate the memory location of an element at indices `(b, h, n, d)`, use th
 ```text
 ((b * H + h) * N + n) * D + d
 
+```
 
 This layout ensures spatial locality: adjacent elements in the innermost dimension (D) are stored contiguously, maximizing cache line utilization. This convention improves cache performance as it also reduces TLB Translation Lookaside Buffer misses.
 
