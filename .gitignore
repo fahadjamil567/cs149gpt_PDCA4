@@ -1,0 +1,18 @@
+# Ignore virtual environment
+vnev/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Environment files
+.env
+
+# Mac system files
+.DS_Store

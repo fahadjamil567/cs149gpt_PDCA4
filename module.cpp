@@ -1,266 +1,313 @@
 #include <torch/extension.h>
 #include <ATen/ATen.h>
-#include <iostream>
-#include <time.h>
-#include <sys/time.h>
 #include <vector>
-#include <immintrin.h>
+#include <cmath>
+#include <algorithm>
 
-// Uncomment for ISPC
-//#include "module_ispc.h"
-//using namespace ispc;
+#include <omp.h>
 
+// ------------------------------------  //
+//     warmup                            //
 // ------------------------------------ //
-// 	WARM-UP: ACCESSING TENSORS      //
-// ------------------------------------ //
 
-// Step #1: Understand Read/Write Accessors for a 2D Tensor
-inline float twoDimRead(std::vector<float> &tensor, int &x, int &y, const int &sizeX) {
-    // Note that sizeX is the size of a Row, not the number of rows
-    return tensor[x * (sizeX)+ y];
+inline float twoDimRead(const std::vector<float> &T, int i, int j, int cols) {
+    return T[i * cols + j];
+}
+inline void twoDimWrite(std::vector<float> &T, int i, int j, int cols, float v) {
+    T[i * cols + j] = v;
 }
 
-inline void twoDimWrite(std::vector<float> &tensor, int &x, int &y, const int &sizeX, float &val) {
-    tensor[x * (sizeX) + y] = val;
+inline float fourDimRead(const std::vector<float> &T,
+                         int b, int h, int n, int d,
+                         int B, int H, int N, int D) {
+    return T[((b*H + h)*N + n)*D + d];
+}
+inline void fourDimWrite(std::vector<float> &T,
+                         int b, int h, int n, int d,
+                         int B, int H, int N, int D, float v) {
+    T[((b*H + h)*N + n)*D + d] = v;
 }
 
-// Step #2: Implement Read/Write Accessors for a 4D Tensor
-inline float fourDimRead(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
-        const int &sizeX, const int &sizeY, const int &sizeZ) {
-    return 0.0;
+static std::vector<float> formatTensor(torch::Tensor t) {
+    t = t.flatten().contiguous();
+    return { t.data_ptr<float>(), t.data_ptr<float>() + t.numel() };
 }
 
-inline void fourDimWrite(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
-        const int &sizeX, const int &sizeY, const int &sizeZ, float &val) {
-    return; 
-}
+// -------------------------------------------------------- //
+//   PART 1                                                 //
+// -------------------------------------------------------- //
 
-// DO NOT EDIT THIS FUNCTION //
-std::vector<float> formatTensor(torch::Tensor tensor) {
-    tensor = tensor.flatten();
-    tensor = tensor.contiguous();
-    std::vector<float> vec(tensor.data_ptr<float>(), tensor.data_ptr<float>() + tensor.numel());
-    return vec;
-}
-
-/* Programming Your Attention Modules.
- * 
- * You are given Q, K, and V Tensors as inputs that are formatted as vectors. We have also created O and QK^t Tensors 
- * that are formatted as vectors. After you have implemented your accessors in the Warm-Up you should be able to
- * read/write to these tensors via the read/write functions above.
- *
- * You are also given 4 integers as parameters: B, H, N, d:
- *
- * B (Batch Size) - The number of samples for your attention layer. Think of it this way - if I asked my dnn
- * a question and it output 5 different answers it had a batch size of 5. These samples are independent of each
- * other and thus can be parallelized.
- *
- * H (Number of Heads) - Each head runs on its own set of Q, K, V matrices. This effectively allows each head
- * to operate the same attention algorithm, but each with each head using different hyperparameters. These
- * allow each head to have their own definition of what relevance is when looking at a token. These heads
- * can operate independently of one another and thus can be parallized.
- *
- * N (Sequence Length) - The number of tokens. You may think of this as the number of words in a sample.
- *
- * d (Embedding Dimensionality) - The number of features each token encodes per attention head. Let's
- * say I encoded a word using the follow (length, number of vowels, has a capital letters). The
- * emvedded dimensionaliy would be 3.
- * */
-
-// ---------------------------------------------------------- //
-//                  PART 1: NAIVE ATTENTION                   //
-// ---------------------------------------------------------- //
-
-torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, torch::Tensor VTensor, torch::Tensor QK_tTensor,
-                int B, int H, int N, int d){
-
-    // Q, K, V are passed in with Shape: (B, H, N, d)
-    //QK^t Intermediate Tensor has Shape (N, N)
+torch::Tensor myNaiveAttention(torch::Tensor Q_, torch::Tensor K_, torch::Tensor V_, torch::Tensor QKt_,
+                               int B, int H, int N, int D) {
+    auto O_   = at::zeros({B,H,N,D}, at::kFloat);
+    auto Q    = formatTensor(Q_), K = formatTensor(K_), V = formatTensor(V_), QKt = formatTensor(QKt_), O = formatTensor(O_);
     
-    //Make O Tensor with Shape (B, H, N, d) 
-    at::Tensor OTensor = at::zeros({B, H, N, d}, at::kFloat);
-
-    //Format O, Q, K, and V tensors into 4D vectors
-    std::vector<float> O = formatTensor(OTensor);
-    std::vector<float> Q = formatTensor(QTensor);
-    std::vector<float> K = formatTensor(KTensor);
-    std::vector<float> V = formatTensor(VTensor);
-
-    //Format QK_t Tensor into a 2D vector.
-    std::vector<float> QK_t = formatTensor(QK_tTensor);
-    
-    /* Here is an example of how to read/write 0's to  Q (B, H, N, d) using the 4D accessors
-
-        //loop over Batch Size
-         for (int b = 0; b < B; b++) {
-
-             //loop over Heads
-             for (int h = 0; h < H; h++) {
-
-                 //loop over Sequence Length
-                 for (int i = 0; i < N; i++) {
-
-                     //loop over Embedding Dimensionality
-                     for (int j = 0; j < d; j++) {
-                        float val = fourDimRead(Q, b, h, i, j, H, N, d);
-                        val = 0.0;
-                        fourDimWrite(Q, b, h, i, j, H, N, d, val);
-                     }
-                 }
-             }
-         }
-    */
-
-    /* Here is an example of how to read/write 0's to  QK_t (N, N) using the 2D accessors
-
-           for (int i = 0; i < N; i++) {
-	       for (int j = 0; j < N; j++) {
-	           float val = twoDimRead(QK_t, i, j, N);
-               val = 0.0;
-	           twoDimWrite(QK_t, i, j, N, val);
-             }
-         }
-    */
-    
-    // -------- YOUR CODE HERE  -------- //
-    
-    // DO NOT EDIT THIS RETURN STATEMENT //
-    // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
-    return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
-}
-
-
-// ---------------------------------------------------------- //
-//     PART 2: BLOCKED MATRIX MULTIPLY AND UNFUSED SOFTMAX    //
-// ---------------------------------------------------------- //
-
-torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTensor, torch::Tensor VTensor, torch::Tensor QK_tTensor,
-                int B, int H, int N, int d){
-    
-    // Q, K, V are passed in with Shape: (B, H, N, d)
-    //QK^t Intermediate Tensor has Shape (N, N)
-
-    //Make O Tensor with Shape (B, H, N, d) 
-    at::Tensor OTensor = at::zeros({B, H, N, d}, at::kFloat);
-
-    //Format O, Q, K, and V tensors into 4D vectors
-    std::vector<float> O = formatTensor(OTensor);
-    std::vector<float> Q = formatTensor(QTensor);
-    std::vector<float> K = formatTensor(KTensor);
-    std::vector<float> V = formatTensor(VTensor);
-
-    //Format QK_t Tensor into a 2D vector.
-    std::vector<float> QK_t = formatTensor(QK_tTensor);
-
-    // -------- YOUR CODE HERE  -------- //
-
-    // DO NOT EDIT THIS RETURN STATEMENT //
-    // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
-    return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
-}
-
-
-// ---------------------------------------------------------- //
-//                 PART 3: FUSED ATTENTION     	              //
-// ---------------------------------------------------------- //
-
-torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, torch::Tensor VTensor, torch::Tensor temp,
-                int B, int H, int N, int d){
-
-    // Q, K, V are passed in with Shape: (B, H, N, d)
-
-    //Make O Tensor with Shape (B, H, N, d)
-    //and O Row Tensor with Shape (N)
-    at::Tensor OTensor = at::zeros({B, H, N, d}, at::kFloat);
-    at::Tensor ORowTensor = at::zeros({N}, at::kFloat);
-
-    //Format Y, Q, K, and V tensors into 4D vectors
-    std::vector<float> O = formatTensor(OTensor);
-    std::vector<float> Q = formatTensor(QTensor);
-    std::vector<float> K = formatTensor(KTensor);
-    std::vector<float> V = formatTensor(VTensor);
-    
-    //Format ORow Tensor into a 1D vector
-    // You can simply access this as ORow[i]
-    std::vector<float> ORow = formatTensor(ORowTensor);
-
-
-    // -------- YOUR CODE HERE  -------- //
-    // We give you a template of the first three loops for your convenience
-    //loop over batch
-    for (int b = 0; b < B; b++){
-
-        //loop over heads
-        for (int h = 0; h < H; h++){
-            for (int i = 0; i < N ; i++){
-
-		// YRow is moved inside so each OpenMP thread gets a local copy.
-                at::Tensor ORowTensor = temp.index({torch::indexing::Slice(omp_get_thread_num(), torch::indexing::None)});      
-                std::vector<float> ORow = formatTensor(ORowTensor);
-		//YOUR CODE HERE
-            }
-	}
-    }
-	    
-	
-    // DO NOT EDIT THIS RETURN STATEMENT //
-    // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
-    return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
-}
-
-
-// ---------------------------------------------------------- //
-//                PART 4: FLASH ATTENTION 		      //
-// ---------------------------------------------------------- //
-
-torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, torch::Tensor VTensor,
-               torch::Tensor QiTensor, torch::Tensor KjTensor, torch::Tensor VjTensor,
-               torch::Tensor SijTensor, torch::Tensor PijTensor, torch::Tensor PVTensor,
-               torch::Tensor OiTensor, torch::Tensor LTensor,  torch::Tensor LiTensor, 
-	       torch::Tensor LijTensor, torch::Tensor LnewTensor, int Bc, int Br,
-                int B, int H, int N, int d) {
+    for(int b=0;b<B;b++) for(int h=0;h<H;h++){
         
-    // Q, K, V are passed in with Shape: (B, H, N, d)
-    // Sij, Pij are passed in with Shape: (Br, Bc)
-    // Kj, Vj are passed in with Shape: (Bc, d)
-    // Qi, Oi, and PV  are passed in with Shape: (Br, d)
-    // L in passed in with Shape: (N)
-    // Li, Lij, and Lnew are passed in with shape (Br)
+        for(int i=0;i<N;i++) for(int j=0;j<N;j++) twoDimWrite(QKt,i,j,N,0.0f);
+        
+        for(int i=0;i<N;i++) for(int k=0;k<D;k++){
+            float qv = fourDimRead(Q,b,h,i,k,B,H,N,D);
+            for(int j=0;j<N;j++)
+                twoDimWrite(QKt,i,j,N,
+                    twoDimRead(QKt,i,j,N) + qv*fourDimRead(K,b,h,j,k,B,H,N,D));
+        }
+        for(int i=0;i<N;i++){
+            float s=0;
+            for(int j=0;j<N;j++){
+                float e = std::exp(twoDimRead(QKt,i,j,N));
+                twoDimWrite(QKt,i,j,N,e);
+                s += e;
+            }
+            for(int j=0;j<N;j++){
+                twoDimWrite(QKt,i,j,N, twoDimRead(QKt,i,j,N)/s );
+            }
+        }
+        for(int i=0;i<N;i++) for(int d=0;d<D;d++){
+            float acc=0;
+            for(int j=0;j<N;j++)
+                acc += twoDimRead(QKt,i,j,N) * fourDimRead(V,b,h,j,d,B,H,N,D);
+            fourDimWrite(O,b,h,i,d,B,H,N,D,acc);
+        }
+    }
+    return torch::from_blob(O.data(),{B,H,N,D},torch::kFloat32).clone();
+}
 
-    //Make O Tensor with Shape (B, H, N, d)
-    at::Tensor OTensor = at::zeros({B, H, N, d}, at::kFloat);
+// ---------------------------------------------------------------- //
+//   PART 2                                                         //
+// ---------------------------------------------------------------- //
+
+torch::Tensor myUnfusedAttentionBlocked(torch::Tensor Q_, torch::Tensor K_, torch::Tensor V_, torch::Tensor QKt_,
+                                        int B, int H, int N, int D) {
+    auto O_   = at::zeros({B,H,N,D}, at::kFloat);
+    auto Q    = formatTensor(Q_), K = formatTensor(K_), V = formatTensor(V_), QKt = formatTensor(QKt_), O = formatTensor(O_);
+    const int BLOCK = 64;  
+    for(int b=0;b<B;b++) for(int h=0;h<H;h++){
+        
+        for(int i=0;i<N;i++) for(int j=0;j<N;j++) twoDimWrite(QKt,i,j,N,0.0f);
+        
+        for(int ii=0;ii<N;ii+=BLOCK){
+            int iend = std::min(ii+BLOCK,N);
+            for(int kk=0;kk<D;kk+=BLOCK){
+                int kend = std::min(kk+BLOCK,D);
+                for(int jj=0;jj<N;jj+=BLOCK){
+                    int jend = std::min(jj+BLOCK,N);
+                    for(int i=ii;i<iend;i++) for(int k=kk;k<kend;k++){
+                        float qv = fourDimRead(Q,b,h,i,k,B,H,N,D);
+                        for(int j=jj;j<jend;j++){
+                            float acc = twoDimRead(QKt,i,j,N) + qv*fourDimRead(K,b,h,j,k,B,H,N,D);
+                            twoDimWrite(QKt,i,j,N,acc);
+                        }
+                    }
+                }
+            }
+        }
+        for(int i=0;i<N;i++){
+            float s=0;
+            for(int j=0;j<N;j++){
+                float e = std::exp(twoDimRead(QKt,i,j,N));
+                twoDimWrite(QKt,i,j,N,e);
+                s+=e;
+            }
+            for(int j=0;j<N;j++)
+                twoDimWrite(QKt,i,j,N, twoDimRead(QKt,i,j,N)/s );
+        }
+        for(int ii=0;ii<N;ii+=BLOCK){
+            int iend = std::min(ii+BLOCK,N);
+            for(int jj=0;jj<N;jj+=BLOCK){
+                int jend = std::min(jj+BLOCK,N);
+                for(int kk=0;kk<D;kk+=BLOCK){
+                    int kend = std::min(kk+BLOCK,D);
+                    for(int i=ii;i<iend;i++) for(int j=jj;j<jend;j++){
+                        float pij = twoDimRead(QKt,i,j,N);
+                        for(int d=kk;d<kend;d++){
+                            float acc = fourDimRead(O,b,h,i,d,B,H,N,D) + pij*fourDimRead(V,b,h,j,d,B,H,N,D);
+                            fourDimWrite(O,b,h,i,d,B,H,N,D,acc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return torch::from_blob(O.data(),{B,H,N,D},torch::kFloat32).clone();
+}
+
+// -------------------------------------------------------- //
+//   PART 3                                                 //
+// -------------------------------------------------------- //
+
+torch::Tensor myFusedAttention(torch::Tensor Q_, torch::Tensor K_, torch::Tensor V_, torch::Tensor temp_,
+                               int B, int H, int N, int D) {
+    auto O_   = at::zeros({B,H,N,D}, at::kFloat);
+    auto Q    = formatTensor(Q_), K = formatTensor(K_), V = formatTensor(V_), O = formatTensor(O_);
    
-    //Format All Tensors into Vectors
-    std::vector<float> O = formatTensor(OTensor);
-    std::vector<float> Q = formatTensor(QTensor);
-    std::vector<float> K = formatTensor(KTensor);
-    std::vector<float> V = formatTensor(VTensor);
-    std::vector<float> Sij = formatTensor(SijTensor);
-    std::vector<float> Pij = formatTensor(PijTensor);
-    std::vector<float> Kj = formatTensor(KjTensor);
-    std::vector<float> Vj = formatTensor(VjTensor);
-    std::vector<float> Qi = formatTensor(QiTensor);
-    std::vector<float> Oi = formatTensor(OiTensor);
-    std::vector<float> l = formatTensor(LTensor);
-    std::vector<float> PV = formatTensor(PVTensor);
-    std::vector<float> li = formatTensor(LiTensor);
-    std::vector<float> lij = formatTensor(LijTensor);
-    std::vector<float> lnew = formatTensor(LnewTensor);
-
-    // -------- YOUR CODE HERE  -------- //
-
-    // DO NOT EDIT THIS RETURN STATEMENT //
-    // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
-    return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
+    auto temp = formatTensor(temp_);
+    int T = omp_get_max_threads();
+#pragma omp parallel for collapse(2)
+    for(int b=0;b<B;b++) for(int h=0;h<H;h++){
+        int tid = omp_get_thread_num();
+        float* rowBuf = temp.data() + tid * N;
+        for(int i=0;i<N;i++){
+            float sum=0;
+            for(int j=0;j<N;j++){
+                float acc=0;
+                for(int k=0;k<D;k++)
+                    acc += fourDimRead(Q,b,h,i,k,B,H,N,D) * fourDimRead(K,b,h,j,k,B,H,N,D);
+                rowBuf[j] = std::exp(acc);
+                sum += rowBuf[j];
+            }
+            for(int j=0;j<N;j++) rowBuf[j] /= sum;
+            for(int d=0;d<D;d++){
+                float acc=0;
+                for(int j=0;j<N;j++)
+                    acc += rowBuf[j] * fourDimRead(V,b,h,j,d,B,H,N,D);
+                fourDimWrite(O,b,h,i,d,B,H,N,D,acc);
+            }
+        }
+    }
+    return torch::from_blob(O.data(),{B,H,N,D},torch::kFloat32).clone();
 }
 
 
-/* DO NOT EDIT THESE BINDINGS */
+
+
+// -------------------------------------------------------- //
+//   PART 4                                                 //
+// -------------------------------------------------------- //
+
+
+torch::Tensor myFlashAttention(torch::Tensor Q_, torch::Tensor K_, torch::Tensor V_,
+                           torch::Tensor Qi_, torch::Tensor Kj_, torch::Tensor Vj_,
+                           torch::Tensor Sij_, torch::Tensor Pij_, torch::Tensor PV_,
+                           torch::Tensor Oi_, torch::Tensor L_, torch::Tensor Li_, 
+                           torch::Tensor Lij_, torch::Tensor Lnew_,
+                           int Bc, int Br, int B, int H, int N, int D) {
+    auto O_ = at::zeros({B,H,N,D}, at::kFloat);
+    auto Q = formatTensor(Q_), K = formatTensor(K_), V = formatTensor(V_), O = formatTensor(O_);
+    auto Qi = formatTensor(Qi_), Kj = formatTensor(Kj_), Vj = formatTensor(Vj_);
+    auto Sij = formatTensor(Sij_), Pij = formatTensor(Pij_), PV = formatTensor(PV_);
+    auto Oi = formatTensor(Oi_), l = formatTensor(L_), li = formatTensor(Li_);
+    auto lij = formatTensor(Lij_), lnew = formatTensor(Lnew_);
+
+    for(int b=0; b<B; b++) for(int h=0; h<H; h++) {
+        for(int i=0; i<N; i++) {
+            l[i] = -std::numeric_limits<float>::infinity();
+        }
+        for(int i0=0; i0<N; i0+=Br) {
+            int iLen = std::min(Br, N-i0);  
+            
+            for(int i=0; i<iLen; i++) {
+                for(int d=0; d<D; d++) {
+                    Qi[i*D + d] = fourDimRead(Q, b, h, i0+i, d, B, H, N, D);
+                }
+            }
+            
+            for(int i=0; i<iLen; i++) {
+                li[i] = l[i0+i];
+                
+                for(int d=0; d<D; d++) {
+                    PV[i*D + d] = 0.0f;
+                }
+            }
+            
+            for(int j0=0; j0<N; j0+=Bc) {
+                int jLen = std::min(Bc, N-j0);  
+                
+                for(int j=0; j<jLen; j++) {
+                    for(int d=0; d<D; d++) {
+                        Kj[j*D + d] = fourDimRead(K, b, h, j0+j, d, B, H, N, D);
+                        Vj[j*D + d] = fourDimRead(V, b, h, j0+j, d, B, H, N, D);
+                    }
+                }
+                
+                for(int i=0; i<iLen; i++) {
+                    lij[i] = -std::numeric_limits<float>::infinity();
+                    
+                    for(int j=0; j<jLen; j++) {
+                        float dot = 0.0f;
+                        for(int d=0; d<D; d++) {
+                            dot += Qi[i*D + d] * Kj[j*D + d];
+                        }
+                        Sij[i*jLen + j] = dot;
+                        lij[i] = std::max(lij[i], dot);
+                    }
+                }
+                
+                for(int i=0; i<iLen; i++) {
+                    float lnew_val = std::max(li[i], lij[i]);
+                    
+                    float scale = (li[i] == -std::numeric_limits<float>::infinity()) ? 
+                                  1.0f : std::exp(li[i] - lnew_val);
+                    
+                    for(int d=0; d<D; d++) {
+                        PV[i*D + d] *= scale;
+                    }
+                    
+                    float sum_exp = 0.0f;
+                    for(int j=0; j<jLen; j++) {
+                        float exp_val = std::exp(Sij[i*jLen + j] - lnew_val);
+                        Pij[i*jLen + j] = exp_val;
+                        sum_exp += exp_val;
+                        
+                        
+                        for(int d=0; d<D; d++) {
+                            PV[i*D + d] += exp_val * Vj[j*D + d];
+                        }
+                    }
+                    
+                    li[i] = lnew_val;
+                    l[i0+i] = lnew_val;
+                }
+            }
+            
+            for(int i=0; i<iLen; i++) {
+                float m = li[i];
+                float denom = 0.0f;
+                
+                for(int j0=0; j0<N; j0+=Bc) {
+                    int jLen = std::min(Bc, N-j0);
+                    
+                    
+                    for(int j=0; j<jLen; j++) {
+                        for(int d=0; d<D; d++) {
+                            Kj[j*D + d] = fourDimRead(K, b, h, j0+j, d, B, H, N, D);
+                        }
+                    }
+                    
+                    for(int j=0; j<jLen; j++) {
+                        float dot = 0.0f;
+                        for(int d=0; d<D; d++) {
+                            dot += Qi[i*D + d] * Kj[j*D + d];
+                        }
+                        denom += std::exp(dot - m);
+                    }
+                }
+                
+                for(int d=0; d<D; d++) {
+                    Oi[i*D + d] = PV[i*D + d] / denom;
+                }
+            }
+            
+            for(int i=0; i<iLen; i++) {
+                for(int d=0; d<D; d++) {
+                    fourDimWrite(O, b, h, i0+i, d, B, H, N, D, Oi[i*D + d]);
+                }
+            }
+        }
+    }
+
+    return torch::from_blob(O.data(), {B,H,N,D}, torch::kFloat32).clone();
+}
+
+// ------------------------------------ //
+//       PYBIND11: BIND EVERYTHING      //
+// ------------------------------------ //
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("myNaiveAttention", &myNaiveAttention, "Naive Attention");
-  m.def("myUnfusedAttentionBlocked", &myUnfusedAttentionBlocked, " Blocked Unfused Attention");
-  m.def("myFusedAttention", &myFusedAttention, "Fused Attention");
-  m.def("myFlashAttention", &myFlashAttention, "Flash Attention");
-  m.def("twoDimRead", &twoDimRead, "twoDimRead");
-  m.def("fourDimRead", &fourDimRead, "fourDimRead");
+    m.def("twoDimRead",               &twoDimRead,               "2D Read");
+    m.def("fourDimRead",              &fourDimRead,              "4D Read");
+    m.def("myNaiveAttention",         &myNaiveAttention,         "Part1: Naive");
+    m.def("myUnfusedAttentionBlocked",&myUnfusedAttentionBlocked,"Part2: Blocked+Softmax");
+    m.def("myFusedAttention",         &myFusedAttention,         "Part3: Fused+OpenMP");
+    m.def("myFlashAttention",         &myFlashAttention,         "Part4: FlashAttention");
 }
