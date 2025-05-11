@@ -105,7 +105,7 @@ This dramatic speedup highlights the importance of cache-aware blocking. By load
 
 Since we still using the entire $QK^T$ matrix (size $N \times N$), the memory usage remains unchanged.
 
-![Part 2 - Blocked Implementation Results](output/Part2.png)  
+![Part 2 - Blocked Implementation Results](output/part2.png)  
 
 
 
@@ -125,7 +125,6 @@ Each Q and K block is reused more effectively within tiles, reducing the number 
 **Estimated Ratio:**  
 > **Part 2 DRAM Access ≈ 1/3 to 1/4 of Part 1**
 
-**Part 2 Output:** ![Part 2](output/Part2.png)
 
 ---
 
@@ -165,7 +164,7 @@ Without OpenMP, the computation becomes **single-threaded**, severely impacting 
 
 - Whereas in Part 3, each row is processed independently, so all rows can be computed at the same time. This makes it easy to parallelize using tools like OpenMP. Also, using less shared memory and having each thread use its own buffer avoids conflicts and makes the program scale better.
 
-**Part 3 Output:** ![Part 3](output/Part3.png)
+**Part 3 Output:** ![Part 3](output/part3.png)
 
 ---
 
@@ -182,8 +181,8 @@ Flash Attention processes and stores only small \( B_r \times B_c \) tiles. Unli
 Flash Attention reference runtime is bit slower than Part 3, with a recorded CPU time of approximately ~435 ms. This slower performance is possibly due to several factors. The computation involves multiple nested loops, lacks OpenMP or threading support, and has a higher arithmetic intensity per iteration. Additionally, the use of log-sum-exp tricks and the management of tiles introduce computational overhead.
 
 **Flash Attention Output:**  
-- ![Part 4 Step 1](output/Part4_1.png)  
-- ![Part 4 Step 2](output/Part4_2.png)
+- ![Part 4 Step 1](output/part4_1.png)  
+- ![Part 4 Step 2](output/part4_2.png)
 
 ### Optimizations to Improve Flash Attention
 
